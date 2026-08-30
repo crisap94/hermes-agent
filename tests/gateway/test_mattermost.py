@@ -750,3 +750,167 @@ class TestMattermostMediaTypes:
         assert msg.media_types == ["application/pdf"]
         assert not msg.media_types[0].startswith("image/")
         assert not msg.media_types[0].startswith("audio/")
+
+
+class TestMattermostChannelIdentity:
+
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._bot_user_id = "bot_user_id"
+        self.adapter._bot_username = "hermes-bot"
+        self.adapter.handle_message = AsyncMock()
+
+    def test_render_includes_slug_display_and_purpose(self):
+        from plugins.platforms.mattermost.adapter import _render_channel_identity
+        out = _render_channel_identity(
+            {"type": "P", "name": "clio-taller", "display_name": "clio · taller",
+             "purpose": "Canal principal de clio"},
+            "chan_1",
+        )
+        assert "#clio-taller" in out
+        assert "clio · taller" in out
+        assert "canal privado" in out
+        assert "Canal principal de clio" in out
+
+    def test_render_includes_header_when_present(self):
+        from plugins.platforms.mattermost.adapter import _render_channel_identity
+        out = _render_channel_identity(
+            {"type": "O", "name": "town-square", "display_name": "Town Square",
+             "purpose": "", "header": "Anuncios del equipo"},
+            "chan_2",
+        )
+        assert "canal público" in out
+        assert "Anuncios del equipo" in out
+
+    def test_render_says_so_when_channel_declares_nothing(self):
+        from plugins.platforms.mattermost.adapter import _render_channel_identity
+        out = _render_channel_identity(
+            {"type": "P", "name": "atlas-ops", "display_name": "Atlas Ops"},
+            "chan_3",
+        )
+        assert "#atlas-ops" in out
+        assert "no asumas" in out
+
+    def test_render_returns_none_for_dm_and_missing_payload(self):
+        from plugins.platforms.mattermost.adapter import _render_channel_identity
+        assert _render_channel_identity({"type": "D", "name": ""}, "d1") is None
+        assert _render_channel_identity(None, "d1") is None
+
+    def test_render_falls_back_to_channel_id_without_slug(self):
+        from plugins.platforms.mattermost.adapter import _render_channel_identity
+        out = _render_channel_identity({"type": "O"}, "chan_raw")
+        assert "chan_raw" in out
+
+    @pytest.mark.asyncio
+    async def test_fetch_channel_is_cached(self):
+        self.adapter._api_get = AsyncMock(
+            return_value={"type": "P", "name": "clio-taller"}
+        )
+        first = await self.adapter._fetch_channel("chan_1")
+        second = await self.adapter._fetch_channel("chan_1")
+        assert first == second
+        self.adapter._api_get.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_get_chat_info_shares_the_same_fetch(self):
+        self.adapter._api_get = AsyncMock(
+            return_value={"type": "P", "name": "clio-taller",
+                          "display_name": "clio · taller"}
+        )
+        await self.adapter._channel_identity_prompt("chan_1")
+        info = await self.adapter.get_chat_info("chan_1")
+        assert info["name"] == "clio · taller"
+        self.adapter._api_get.assert_called_once()
+
+    def test_channel_identity_can_be_disabled(self):
+        assert self.adapter._channel_identity_enabled() is True
+        self.adapter.config.extra["channel_identity"] = False
+        assert self.adapter._channel_identity_enabled() is False
+        self.adapter.config.extra["channel_identity"] = "off"
+        assert self.adapter._channel_identity_enabled() is False
+
+
+class TestMattermostPeerAgentChain:
+
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter.config.extra["peer_agents"] = ["agent_a", "agent_b"]
+
+    def test_non_peer_sender_never_trips_the_cap(self):
+        for _ in range(20):
+            assert self.adapter._peer_chain_exceeded("t1", "human_1") is False
+
+    def test_peer_chain_trips_after_the_cap(self):
+        self.adapter.config.extra["peer_chain_max"] = 3
+        results = [self.adapter._peer_chain_exceeded("t1", "agent_a")
+                   for _ in range(5)]
+        assert results == [False, False, False, True, True]
+
+    def test_human_message_resets_the_chain(self):
+        self.adapter.config.extra["peer_chain_max"] = 2
+        self.adapter._peer_chain_exceeded("t1", "agent_a")
+        self.adapter._peer_chain_exceeded("t1", "agent_a")
+        assert self.adapter._peer_chain_exceeded("t1", "agent_a") is True
+        self.adapter._peer_chain_exceeded("t1", "human_1")
+        assert self.adapter._peer_chain_exceeded("t1", "agent_a") is False
+
+    def test_chains_are_tracked_per_thread(self):
+        self.adapter.config.extra["peer_chain_max"] = 1
+        assert self.adapter._peer_chain_exceeded("t1", "agent_a") is False
+        assert self.adapter._peer_chain_exceeded("t2", "agent_a") is False
+        assert self.adapter._peer_chain_exceeded("t1", "agent_a") is True
+
+    def test_peer_agents_accepts_comma_separated_env(self):
+        self.adapter.config.extra.pop("peer_agents", None)
+        with patch.dict(os.environ, {"MATTERMOST_PEER_AGENTS": "agent_a, agent_b"}):
+            assert self.adapter._peer_agent_ids() == {"agent_a", "agent_b"}
+
+    def test_peer_chain_max_falls_back_on_bad_value(self):
+        self.adapter.config.extra["peer_chain_max"] = "not-a-number"
+        assert self.adapter._peer_chain_max() == 4
+
+
+class TestMattermostSessionLoopAffinity:
+
+    def setup_method(self):
+        self.adapter = _make_adapter()
+
+    @pytest.mark.asyncio
+    async def test_reuses_shared_session_on_its_own_loop(self):
+        import asyncio
+        shared = MagicMock()
+        shared.closed = False
+        self.adapter._session = shared
+        self.adapter._session_loop = asyncio.get_running_loop()
+
+        async with self.adapter._http() as session:
+            assert session is shared
+
+    @pytest.mark.asyncio
+    async def test_creates_and_closes_a_session_off_loop(self):
+        shared = MagicMock()
+        shared.closed = False
+        self.adapter._session = shared
+        self.adapter._session_loop = MagicMock()
+
+        created = MagicMock()
+        created.close = AsyncMock()
+        with patch("aiohttp.ClientSession", return_value=created):
+            async with self.adapter._http() as session:
+                assert session is created
+                assert session is not shared
+        created.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_creates_a_session_when_the_shared_one_is_closed(self):
+        shared = MagicMock()
+        shared.closed = True
+        self.adapter._session = shared
+        self.adapter._session_loop = None
+
+        created = MagicMock()
+        created.close = AsyncMock()
+        with patch("aiohttp.ClientSession", return_value=created):
+            async with self.adapter._http() as session:
+                assert session is created
+        created.close.assert_awaited_once()

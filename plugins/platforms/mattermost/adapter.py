@@ -18,6 +18,8 @@ import json
 import logging
 import os
 import re
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -48,6 +50,58 @@ _CHANNEL_TYPE_MAP = {
 _RECONNECT_BASE_DELAY = 2.0
 _RECONNECT_MAX_DELAY = 60.0
 _RECONNECT_JITTER = 0.2
+
+_CHANNEL_TTL = 300.0
+_CHANNEL_CACHE_MAX = 256
+_PEER_CHAIN_DEFAULT_MAX = 4
+
+_CHANNEL_KIND_LABELS = {
+    "P": "canal privado",
+    "G": "canal de grupo",
+    "O": "canal público",
+}
+
+
+def _render_channel_identity(
+    data: Optional[Dict[str, Any]],
+    channel_id: str,
+) -> Optional[str]:
+    if not data:
+        return None
+
+    raw_type = data.get("type", "O")
+    if raw_type == "D":
+        return None
+
+    slug = (data.get("name") or "").strip()
+    display = (data.get("display_name") or "").strip()
+    purpose = (data.get("purpose") or "").strip()
+    header = (data.get("header") or "").strip()
+
+    label = f"#{slug}" if slug else channel_id
+    if display and display != slug:
+        label = f"{label} ({display})"
+
+    lines = [
+        f"Estás respondiendo en {label}, "
+        f"{_CHANNEL_KIND_LABELS.get(raw_type, 'canal')} de Mattermost."
+    ]
+    if purpose:
+        lines.append(f"Propósito del canal: {purpose}")
+    if header:
+        lines.append(f"Encabezado del canal: {header}")
+    if not purpose and not header:
+        lines.append(
+            "El canal no declara propósito ni encabezado, así que no asumas "
+            "para qué es: si importa, preguntá."
+        )
+    return "\n".join(lines)
+
+# Thread-context / in-thread auto-response parameters (Slack parity).
+_THREAD_CONTEXT_MAX_MESSAGES = 30
+_THREAD_CONTEXT_MAX_CHARS = 1000
+_THREAD_CONTEXT_TTL = 60.0
+_MENTIONED_THREADS_MAX = 5000
 
 
 def check_mattermost_requirements() -> bool:
@@ -85,6 +139,7 @@ class MattermostAdapter(BasePlatformAdapter):
 
         # aiohttp session + websocket handle
         self._session: Any = None  # aiohttp.ClientSession
+        self._session_loop: Optional[asyncio.AbstractEventLoop] = None
         self._ws: Any = None       # aiohttp.ClientWebSocketResponse
         self._ws_task: Optional[asyncio.Task] = None
         self._reconnect_task: Optional[asyncio.Task] = None
@@ -99,6 +154,14 @@ class MattermostAdapter(BasePlatformAdapter):
         # Dedup cache (prevent reprocessing)
         self._dedup = MessageDeduplicator()
 
+        self._channel_cache: Dict[str, Tuple[Optional[Dict[str, Any]], float]] = {}
+        self._peer_chain: Dict[str, int] = {}
+
+        # In-thread auto-response (Slack parity): threads where the bot was
+        # @mentioned, and a TTL cache of fetched thread context.
+        self._mentioned_threads: set[str] = set()
+        self._thread_context_cache: Dict[str, Tuple[str, float]] = {}
+
     # ------------------------------------------------------------------
     # HTTP helpers
     # ------------------------------------------------------------------
@@ -109,17 +172,41 @@ class MattermostAdapter(BasePlatformAdapter):
             "Content-Type": "application/json",
         }
 
+    @asynccontextmanager
+    async def _http(self):
+        import aiohttp
+
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+
+        if (
+            self._session is not None
+            and getattr(self._session, "closed", False) is not True
+            and (self._session_loop is None or self._session_loop is running)
+        ):
+            yield self._session
+            return
+
+        session = aiohttp.ClientSession()
+        try:
+            yield session
+        finally:
+            await session.close()
+
     async def _api_get(self, path: str) -> Dict[str, Any]:
         """GET /api/v4/{path}."""
         import aiohttp
         url = f"{self._base_url}/api/v4/{path.lstrip('/')}"
         try:
-            async with self._session.get(url, headers=self._headers(), timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                if resp.status >= 400:
-                    body = await resp.text()
-                    logger.error("MM API GET %s → %s: %s", path, resp.status, body[:200])
-                    return {}
-                return await resp.json()
+            async with self._http() as session:
+                async with session.get(url, headers=self._headers(), timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status >= 400:
+                        body = await resp.text()
+                        logger.error("MM API GET %s → %s: %s", path, resp.status, body[:200])
+                        return {}
+                    return await resp.json()
         except aiohttp.ClientError as exc:
             logger.error("MM API GET %s network error: %s", path, exc)
             return {}
@@ -131,15 +218,16 @@ class MattermostAdapter(BasePlatformAdapter):
         import aiohttp
         url = f"{self._base_url}/api/v4/{path.lstrip('/')}"
         try:
-            async with self._session.post(
-                url, headers=self._headers(), json=payload,
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as resp:
-                if resp.status >= 400:
-                    body = await resp.text()
-                    logger.error("MM API POST %s → %s: %s", path, resp.status, body[:200])
-                    return {}
-                return await resp.json()
+            async with self._http() as session:
+                async with session.post(
+                    url, headers=self._headers(), json=payload,
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as resp:
+                    if resp.status >= 400:
+                        body = await resp.text()
+                        logger.error("MM API POST %s → %s: %s", path, resp.status, body[:200])
+                        return {}
+                    return await resp.json()
         except aiohttp.ClientError as exc:
             logger.error("MM API POST %s network error: %s", path, exc)
             return {}
@@ -151,14 +239,15 @@ class MattermostAdapter(BasePlatformAdapter):
         import aiohttp
         url = f"{self._base_url}/api/v4/{path.lstrip('/')}"
         try:
-            async with self._session.put(
-                url, headers=self._headers(), json=payload
-            ) as resp:
-                if resp.status >= 400:
-                    body = await resp.text()
-                    logger.error("MM API PUT %s → %s: %s", path, resp.status, body[:200])
-                    return {}
-                return await resp.json()
+            async with self._http() as session:
+                async with session.put(
+                    url, headers=self._headers(), json=payload
+                ) as resp:
+                    if resp.status >= 400:
+                        body = await resp.text()
+                        logger.error("MM API PUT %s → %s: %s", path, resp.status, body[:200])
+                        return {}
+                    return await resp.json()
         except aiohttp.ClientError as exc:
             logger.error("MM API PUT %s network error: %s", path, exc)
             return {}
@@ -179,14 +268,15 @@ class MattermostAdapter(BasePlatformAdapter):
             content_type=content_type,
         )
         headers = {"Authorization": f"Bearer {self._token}"}
-        async with self._session.post(url, headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-            if resp.status >= 400:
-                body = await resp.text()
-                logger.error("MM file upload → %s: %s", resp.status, body[:200])
-                return None
-            data = await resp.json()
-            infos = data.get("file_infos", [])
-            return infos[0]["id"] if infos else None
+        async with self._http() as session:
+            async with session.post(url, headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                if resp.status >= 400:
+                    body = await resp.text()
+                    logger.error("MM file upload → %s: %s", resp.status, body[:200])
+                    return None
+                data = await resp.json()
+                infos = data.get("file_infos", [])
+                return infos[0]["id"] if infos else None
 
     # ------------------------------------------------------------------
     # Required overrides
@@ -203,6 +293,7 @@ class MattermostAdapter(BasePlatformAdapter):
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30)
         )
+        self._session_loop = asyncio.get_running_loop()
         self._closing = False
 
         # Verify credentials and fetch bot identity.
@@ -280,17 +371,23 @@ class MattermostAdapter(BasePlatformAdapter):
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, MAX_POST_LENGTH)
 
+        # Thread target: an explicit reply_to (a reply to a specific message) OR
+        # a thread_id passed via metadata (an outbound message threaded under a
+        # known root — cron deliveries and cross-platform ops-event threads route
+        # the root post id through metadata, never reply_to). Reading both is what
+        # makes a gateway-initiated threaded send actually nest under its root.
+        thread_target = reply_to or (metadata or {}).get("thread_id")
+
         last_id = None
         for chunk in chunks:
             payload: Dict[str, Any] = {
                 "channel_id": chat_id,
                 "message": chunk,
             }
-            # Thread support: reply_to is the root post ID.
-            if reply_to and self._reply_mode == "thread":
+            if thread_target and self._reply_mode == "thread":
                 # Ensure root_id points to the thread root, not a reply.
                 # Mattermost rejects non-root post IDs as root_id.
-                resolved_root = await self._resolve_root_id(reply_to)
+                resolved_root = await self._resolve_root_id(thread_target)
                 payload["root_id"] = resolved_root
 
             data = await self._api_post("posts", payload)
@@ -300,15 +397,70 @@ class MattermostAdapter(BasePlatformAdapter):
 
         return SendResult(success=True, message_id=last_id)
 
+    async def _fetch_channel(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        now = time.monotonic()
+        cached = self._channel_cache.get(channel_id)
+        if cached and (now - cached[1]) < _CHANNEL_TTL:
+            return cached[0]
+
+        try:
+            data = await self._api_get(f"channels/{channel_id}") or None
+        except Exception as exc:
+            logger.debug("Mattermost: channel fetch failed: %s", exc)
+            data = None
+
+        if len(self._channel_cache) > _CHANNEL_CACHE_MAX:
+            self._channel_cache.clear()
+        self._channel_cache[channel_id] = (data, now)
+        return data
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
-        """Return channel name and type."""
-        data = await self._api_get(f"channels/{chat_id}")
+        data = await self._fetch_channel(chat_id)
         if not data:
             return {"name": chat_id, "type": "channel"}
 
         ch_type = _CHANNEL_TYPE_MAP.get(data.get("type", "O"), "channel")
         display_name = data.get("display_name") or data.get("name") or chat_id
         return {"name": display_name, "type": ch_type}
+
+    def _channel_identity_enabled(self) -> bool:
+        value = self.config.extra.get("channel_identity", True)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() not in {"false", "0", "no", "off"}
+
+    async def _channel_identity_prompt(self, channel_id: str) -> Optional[str]:
+        data = await self._fetch_channel(channel_id)
+        return _render_channel_identity(data, channel_id)
+
+    def _peer_agent_ids(self) -> set:
+        raw = self.config.extra.get("peer_agents") or os.getenv(
+            "MATTERMOST_PEER_AGENTS", ""
+        )
+        if isinstance(raw, (list, tuple, set)):
+            items = raw
+        else:
+            items = re.split(r"[,\s]+", str(raw))
+        return {str(i).strip() for i in items if str(i).strip()}
+
+    def _peer_chain_max(self) -> int:
+        try:
+            return int(
+                self.config.extra.get("peer_chain_max")
+                or os.getenv("MATTERMOST_PEER_CHAIN_MAX", _PEER_CHAIN_DEFAULT_MAX)
+            )
+        except (TypeError, ValueError):
+            return _PEER_CHAIN_DEFAULT_MAX
+
+    def _peer_chain_exceeded(self, thread_key: str, sender_id: str) -> bool:
+        if sender_id in self._peer_agent_ids():
+            count = self._peer_chain.get(thread_key, 0) + 1
+            if len(self._peer_chain) > _CHANNEL_CACHE_MAX:
+                self._peer_chain.clear()
+            self._peer_chain[thread_key] = count
+            return count > self._peer_chain_max()
+        self._peer_chain.pop(thread_key, None)
+        return False
 
     # ------------------------------------------------------------------
     # Optional overrides
@@ -438,7 +590,9 @@ class MattermostAdapter(BasePlatformAdapter):
 
         for attempt in range(3):
             try:
-                async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                async with self._http() as session, session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=30)
+                ) as resp:
                     if resp.status >= 500 or resp.status == 429:
                         if attempt < 2:
                             logger.debug("Mattermost download retry %d/2 for %s (status %d)",
@@ -568,7 +722,7 @@ class MattermostAdapter(BasePlatformAdapter):
                             logger.warning("Mattermost: blocked unsafe image URL in batch")
                             continue
                         try:
-                            async with self._session.get(
+                            async with self._http() as session, session.get(
                                 image_url, timeout=aiohttp.ClientTimeout(total=30)
                             ) as resp:
                                 if resp.status >= 400:
@@ -688,6 +842,149 @@ class MattermostAdapter(BasePlatformAdapter):
                 logger.info("Mattermost: WebSocket closed (%s)", raw_msg.type)
                 break
 
+    def _strict_mention(self) -> bool:
+        """Return True when every turn requires a fresh @mention (in-thread auto-response opt-out)."""
+        configured = self.config.extra.get("strict_mention") if self.config.extra else None
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return os.getenv("MATTERMOST_STRICT_MENTION", "false").lower() in {
+            "true", "1", "yes", "on",
+        }
+
+    def _thread_context_mode(self) -> str:
+        """Return the thread-context policy: 'off', 'allowlisted' (default), or 'all'."""
+        configured = self.config.extra.get("thread_context") if self.config.extra else None
+        raw = configured if configured is not None else os.getenv(
+            "MATTERMOST_THREAD_CONTEXT", "allowlisted"
+        )
+        mode = str(raw).strip().lower()
+        return mode if mode in {"off", "allowlisted", "all"} else "allowlisted"
+
+    def _thread_context_author_allowed(self, user_id: str) -> bool:
+        """Return True when a thread author may contribute to injected context.
+
+        authz only checks the triggering author; injected thread context bypasses
+        it, so non-allowlisted authors' posts are filtered here to avoid leaking
+        unauthorized content into the model. MATTERMOST_THREAD_CONTEXT=all opts
+        out of this filter without widening who may invoke the bot.
+        """
+        if self._thread_context_mode() == "all":
+            return True
+
+        def _truthy(value: str) -> bool:
+            return str(value).lower() in {"true", "1", "yes", "on"}
+
+        if _truthy(os.getenv("MATTERMOST_ALLOW_ALL_USERS", "")) or _truthy(
+            os.getenv("GATEWAY_ALLOW_ALL_USERS", "")
+        ):
+            return True
+        allowed = {
+            u.strip()
+            for u in os.getenv("MATTERMOST_ALLOWED_USERS", "").split(",")
+            if u.strip()
+        }
+        return bool(user_id) and user_id in allowed
+
+    def _has_active_session_for_thread(
+        self, channel_id: str, thread_id: str, chat_type: str, user_id: str
+    ) -> bool:
+        """Return True when a gateway session already exists for this thread."""
+        session_store = getattr(self, "_session_store", None)
+        if not session_store:
+            return False
+        try:
+            from gateway.session import SessionSource, build_session_key
+
+            source = SessionSource(
+                platform=Platform.MATTERMOST,
+                chat_id=channel_id,
+                chat_type=chat_type,
+                user_id=user_id,
+                thread_id=thread_id,
+            )
+            store_cfg = getattr(session_store, "config", None)
+            gspu = (
+                getattr(store_cfg, "group_sessions_per_user", True)
+                if store_cfg
+                else True
+            )
+            tspu = (
+                getattr(store_cfg, "thread_sessions_per_user", False)
+                if store_cfg
+                else False
+            )
+            session_key = build_session_key(
+                source,
+                group_sessions_per_user=gspu,
+                thread_sessions_per_user=tspu,
+            )
+            session_store._ensure_loaded()
+            return session_key in session_store._entries
+        except Exception:
+            return False
+
+    async def _fetch_thread_context(
+        self, thread_root_id: str, current_post_id: str
+    ) -> str:
+        """Fetch prior thread messages to seed context on the first turn.
+
+        Fails open: returns an empty string on error or when nothing qualifies,
+        leaving the agent with just the triggering message.
+        """
+        now = time.monotonic()
+        cached = self._thread_context_cache.get(thread_root_id)
+        if cached and (now - cached[1]) < _THREAD_CONTEXT_TTL:
+            return cached[0]
+
+        data = await self._api_get(f"posts/{thread_root_id}/thread")
+        if not data:
+            return ""
+        order = data.get("order") or []
+        posts = data.get("posts") or {}
+        if not order or not posts:
+            return ""
+
+        post_objs = [posts[pid] for pid in order if pid in posts]
+        post_objs.sort(key=lambda p: p.get("create_at", 0))
+
+        parts: List[str] = []
+        for post in post_objs:
+            if post.get("id", "") == current_post_id:
+                continue
+            author = post.get("user_id", "")
+            if author == self._bot_user_id:
+                continue
+            if post.get("type"):
+                continue
+            if not self._thread_context_author_allowed(author):
+                continue
+            text = (post.get("message") or "").strip()
+            for pattern in (f"@{self._bot_username}", f"@{self._bot_user_id}"):
+                text = re.sub(re.escape(pattern), "", text, flags=re.IGNORECASE).strip()
+            if not text:
+                continue
+            if len(text) > _THREAD_CONTEXT_MAX_CHARS:
+                text = text[:_THREAD_CONTEXT_MAX_CHARS] + "..."
+            parts.append(f"[{author or 'unknown'}]: {text}")
+
+        if len(parts) > _THREAD_CONTEXT_MAX_MESSAGES:
+            parts = parts[-_THREAD_CONTEXT_MAX_MESSAGES:]
+
+        content = ""
+        if parts:
+            content = (
+                "[Thread context - prior messages in this thread:]\n"
+                + "\n".join(parts)
+                + "\n[End of thread context]"
+            )
+
+        if len(self._thread_context_cache) > _MENTIONED_THREADS_MAX:
+            self._thread_context_cache.clear()
+        self._thread_context_cache[thread_root_id] = (content, now)
+        return content
+
     async def _handle_ws_event(self, event: Dict[str, Any]) -> None:
         """Process a single WebSocket event."""
         event_type = event.get("event")
@@ -725,12 +1022,30 @@ class MattermostAdapter(BasePlatformAdapter):
 
         # For DMs, user_id is sufficient.  For channels, check for @mention.
         message_text = post.get("message", "")
+        sender_id = post.get("user_id", "")
+        sender_name = data.get("sender_name", "").lstrip("@") or sender_id
+        thread_id = post.get("root_id") or None
+        # Mattermost root posts have an empty root_id; in thread mode the bot
+        # nests replies under the root, so seed thread_id from the post's own id
+        # to keep the root and its replies on one session (and one mentioned thread).
+        if thread_id is None and self._reply_mode == "thread":
+            thread_id = post.get("id") or None
+
+        if self._peer_chain_exceeded(f"{channel_id}:{thread_id or post_id}", sender_id):
+            logger.info(
+                "Mattermost: peer-agent chain cap reached in %s; dropping message "
+                "from %s to break the loop",
+                channel_id,
+                sender_id,
+            )
+            return
 
         # Mention-gating for non-DM channels.
         # Config (config.yaml `mattermost.*` with env-var fallback):
         #   require_mention / MATTERMOST_REQUIRE_MENTION: Require @mention in channels (default: true)
         #   free_response_channels / MATTERMOST_FREE_RESPONSE_CHANNELS: Channel IDs where bot responds without mention
         #   allowed_channels / MATTERMOST_ALLOWED_CHANNELS: If set, bot ONLY responds in these channels (whitelist)
+        #   strict_mention / MATTERMOST_STRICT_MENTION: Require a fresh @mention every turn (disables in-thread auto-response)
         if channel_type_raw != "D":
             # allowed_channels check (whitelist — must pass before other gating).
             # When set, messages from channels NOT in this list are silently
@@ -759,6 +1074,8 @@ class MattermostAdapter(BasePlatformAdapter):
             free_channels = {ch.strip() for ch in free_channels_raw.split(",") if ch.strip()}
             is_free_channel = channel_id in free_channels
 
+            strict_mention = self._strict_mention()
+
             mention_patterns = [
                 f"@{self._bot_username}",
                 f"@{self._bot_user_id}",
@@ -768,12 +1085,38 @@ class MattermostAdapter(BasePlatformAdapter):
                 for pattern in mention_patterns
             )
 
-            if require_mention and not is_free_channel and not has_mention:
+            in_mentioned_thread = False
+            has_session = False
+            if thread_id and not strict_mention:
+                in_mentioned_thread = thread_id in self._mentioned_threads
+                if not in_mentioned_thread:
+                    has_session = self._has_active_session_for_thread(
+                        channel_id=channel_id,
+                        thread_id=thread_id,
+                        chat_type=chat_type,
+                        user_id=sender_id,
+                    )
+
+            if is_free_channel or not require_mention:
+                pass
+            elif has_mention:
+                pass
+            elif in_mentioned_thread or has_session:
+                pass
+            else:
                 logger.debug(
-                    "Mattermost: skipping non-DM message without @mention (channel=%s)",
+                    "Mattermost: skipping non-DM message (no mention / not in "
+                    "mentioned thread / no session) channel=%s thread=%s",
                     channel_id,
+                    thread_id,
                 )
                 return
+
+            if has_mention and thread_id and not strict_mention:
+                self._mentioned_threads.add(thread_id)
+                if len(self._mentioned_threads) > _MENTIONED_THREADS_MAX:
+                    for stale in list(self._mentioned_threads)[: _MENTIONED_THREADS_MAX // 2]:
+                        self._mentioned_threads.discard(stale)
 
             # Strip @mention from the message text so the agent sees clean input.
             if has_mention:
@@ -781,13 +1124,6 @@ class MattermostAdapter(BasePlatformAdapter):
                     message_text = re.sub(
                         re.escape(pattern), "", message_text, flags=re.IGNORECASE
                     ).strip()
-
-        # Resolve sender info.
-        sender_id = post.get("user_id", "")
-        sender_name = data.get("sender_name", "").lstrip("@") or sender_id
-
-        # Thread support: if the post is in a thread, use root_id.
-        thread_id = post.get("root_id") or None
 
         # Determine message type.
         file_ids = post.get("file_ids") or []
@@ -808,7 +1144,7 @@ class MattermostAdapter(BasePlatformAdapter):
 
                 import aiohttp
                 dl_url = f"{self._base_url}/api/v4/files/{fid}"
-                async with self._session.get(
+                async with self._http() as session, session.get(
                     dl_url,
                     headers={"Authorization": f"Bearer {self._token}"},
                     timeout=aiohttp.ClientTimeout(total=30),
@@ -856,6 +1192,33 @@ class MattermostAdapter(BasePlatformAdapter):
         _channel_prompt = resolve_channel_prompt(
             self.config.extra, channel_id, None,
         )
+        if (
+            not _channel_prompt
+            and channel_type_raw != "D"
+            and self._channel_identity_enabled()
+        ):
+            _channel_prompt = await self._channel_identity_prompt(channel_id)
+
+        # On the first turn of a thread (no session yet), seed prior thread
+        # history so the agent sees the whole conversation, not just the
+        # triggering message. Later turns already carry it in the transcript.
+        channel_context: Optional[str] = None
+        if thread_id and channel_type_raw != "D" and self._thread_context_mode() != "off":
+            already_active = self._has_active_session_for_thread(
+                channel_id=channel_id,
+                thread_id=thread_id,
+                chat_type=chat_type,
+                user_id=sender_id,
+            )
+            if not already_active:
+                try:
+                    channel_context = await self._fetch_thread_context(
+                        thread_root_id=thread_id,
+                        current_post_id=post_id,
+                    ) or None
+                except Exception as exc:
+                    logger.debug("Mattermost: thread context fetch failed: %s", exc)
+                    channel_context = None
 
         msg_event = MessageEvent(
             text=message_text,
@@ -866,6 +1229,7 @@ class MattermostAdapter(BasePlatformAdapter):
             media_urls=media_urls if media_urls else None,
             media_types=media_types if media_types else None,
             channel_prompt=_channel_prompt,
+            channel_context=channel_context,
         )
 
         await self.handle_message(msg_event)
